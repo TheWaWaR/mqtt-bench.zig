@@ -54,21 +54,12 @@ const Connection = struct {
     write_buf: []u8,
     write_idx: usize = 0,
 
-    pub fn init(state: *ServerState, new_fd: posix.socket_t) Connection {
-        const read_buf = state.allocator.alloc(u8, 256) catch unreachable;
-        const write_buf = state.allocator.alloc(u8, 256) catch unreachable;
+    pub fn init(state: *ServerState) Connection {
+        const buf = state.allocator.alloc(u8, 512) catch unreachable;
+        const read_buf = buf[0..256];
+        const write_buf = buf[256..512];
         const read_comp: *xev.Completion = state.allocator.create(xev.Completion) catch unreachable;
         const write_comp: *xev.Completion = state.allocator.create(xev.Completion) catch unreachable;
-        read_comp.* = .{
-            .op = .{
-                .recv = .{
-                    .fd = new_fd,
-                    .buffer = .{ .slice = read_buf },
-                },
-            },
-            .userdata = state,
-            .callback = recvCallback,
-        };
         return .{
             .read_comp = read_comp,
             .read_buf = read_buf,
@@ -95,7 +86,17 @@ fn acceptCallback(
 
     const new_fd = result.accept catch unreachable;
     var state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
-    const new_conn = Connection.init(state, new_fd);
+    const new_conn = Connection.init(state);
+    new_conn.read_comp.* = .{
+        .op = .{
+            .recv = .{
+                .fd = new_fd,
+                .buffer = .{ .slice = new_conn.read_buf },
+            },
+        },
+        .userdata = state,
+        .callback = recvCallback,
+    };
     loop.add(new_conn.read_comp);
     state.connections.put(new_fd, new_conn) catch unreachable;
 
