@@ -48,28 +48,40 @@ const ServerState = struct {
 };
 
 const Connection = struct {
-    completion: *xev.Completion,
-    read_buffer: []u8,
+    read_comp: *xev.Completion,
+    read_buf: []u8,
+    write_comp: *xev.Completion,
+    write_buf: []u8,
+    write_idx: usize = 0,
 
     pub fn init(state: *ServerState, new_fd: posix.socket_t) Connection {
-        const read_buffer = state.allocator.alloc(u8, 512) catch unreachable;
-        const c_recv: *xev.Completion = state.allocator.create(xev.Completion) catch unreachable;
-        c_recv.* = .{
+        const read_buf = state.allocator.alloc(u8, 256) catch unreachable;
+        const write_buf = state.allocator.alloc(u8, 256) catch unreachable;
+        const read_comp: *xev.Completion = state.allocator.create(xev.Completion) catch unreachable;
+        const write_comp: *xev.Completion = state.allocator.create(xev.Completion) catch unreachable;
+        read_comp.* = .{
             .op = .{
                 .recv = .{
                     .fd = new_fd,
-                    .buffer = .{ .slice = read_buffer },
+                    .buffer = .{ .slice = read_buf },
                 },
             },
             .userdata = state,
             .callback = recvCallback,
         };
-        return .{ .completion = c_recv, .read_buffer = read_buffer };
+        return .{
+            .read_comp = read_comp,
+            .read_buf = read_buf,
+            .write_comp = write_comp,
+            .write_buf = write_buf,
+        };
     }
 
     pub fn deinit(self: *Connection, allocator: mem.Allocator) void {
-        allocator.destroy(self.completion);
-        allocator.free(self.read_buffer);
+        allocator.destroy(self.read_comp);
+        allocator.destroy(self.write_comp);
+        allocator.free(self.read_buf);
+        allocator.free(self.write_buf);
     }
 };
 
@@ -84,7 +96,7 @@ fn acceptCallback(
     const new_fd = result.accept catch unreachable;
     var state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
     const new_conn = Connection.init(state, new_fd);
-    loop.add(new_conn.completion);
+    loop.add(new_conn.read_comp);
     state.connections.put(new_fd, new_conn) catch unreachable;
 
     return .rearm;
@@ -98,14 +110,16 @@ fn recvCallback(
 ) xev.CallbackAction {
     std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
 
-    const fd = comp.op.recv.fd;
+    const recv = comp.op.recv;
     const state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
     const read_len = result.recv catch {
-        var pair = state.connections.fetchRemove(fd).?;
+        var pair = state.connections.fetchRemove(recv.fd).?;
         pair.value.deinit(state.allocator);
         return .disarm;
     };
-    const buffer = comp.op.recv.buffer.slice;
-    std.log.info("Recv from {} ({}/{}): {s}", .{ fd, read_len, buffer.len, buffer[0..read_len] });
+    std.log.info(
+        "Recv from {} ({} bytes): {s}",
+        .{ recv.fd, read_len, recv.buffer.slice[0..read_len] },
+    );
     return .rearm;
 }
