@@ -1,5 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
+const flags = @import("flags");
 
 const Instant = std.time.Instant;
 const mem = std.mem;
@@ -8,6 +9,15 @@ const posix = std.posix;
 const assert = std.debug.assert;
 
 pub fn main() !void {
+    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
+    const gpa = general_purpose_allocator.allocator();
+
+    var args = try std.process.argsWithAllocator(gpa);
+    defer args.deinit();
+
+    const cli = flags.parse(&args, Cli, .{});
+    std.log.info("Server: {s}:{}", .{ cli.host, cli.port });
+
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
@@ -22,8 +32,6 @@ pub fn main() !void {
 
     std.log.info("Listen on {any}", .{address});
 
-    var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    const gpa = general_purpose_allocator.allocator();
     var state = ServerState{
         .connections = ConnMap.init(gpa),
         .allocator = gpa,
@@ -39,6 +47,22 @@ pub fn main() !void {
     // Run the loop until there are no more completions.
     try loop.run(.until_done);
 }
+
+const Cli = struct {
+    pub const name = "mqtt-bench";
+    pub const help =
+        \\A MQTT benchmark tool written in Zig.
+        \\Based on io_uring, which is blazing fast!
+    ;
+
+    host: []const u8 = "test.mosquitto.org",
+    port: u16 = 1883,
+
+    pub const descriptions = .{
+        .host = "Host address",
+        .port = "Host port",
+    };
+};
 
 const ServerState = struct {
     connections: ConnMap,
