@@ -56,7 +56,7 @@ const Connection = struct {
     buf: [521]u8,
     read_comp: xev.Completion,
     write_comp: xev.Completion,
-    write_idx: usize = 0,
+    write_len: usize = 0,
 
     server_state: *ServerState,
 
@@ -107,7 +107,7 @@ fn acceptCallback(
 
 fn recvCallback(
     ud: ?*anyopaque,
-    _: *xev.Loop,
+    loop: *xev.Loop,
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
@@ -117,11 +117,62 @@ fn recvCallback(
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     const read_len = result.recv catch {
         conn.server_state.remove(recv.fd);
+        // TODO: Close connection
         return .disarm;
     };
     std.log.info(
         "Recv from {} ({} bytes): {s}",
         .{ recv.fd, read_len, recv.buffer.slice[0..read_len] },
     );
+    conn.write_comp = .{
+        .op = .{
+            .send = .{
+                .fd = recv.fd,
+                .buffer = .{ .slice = recv.buffer.slice[0..read_len] },
+            },
+        },
+        .userdata = ud,
+        .callback = sendCallback,
+    };
+    loop.add(&conn.write_comp);
+    return .disarm;
+}
+
+fn sendCallback(
+    ud: ?*anyopaque,
+    loop: *xev.Loop,
+    comp: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
+
+    const send = comp.op.send;
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    const send_len = result.send catch {
+        conn.server_state.remove(send.fd);
+        // TODO: Close connection
+        return .disarm;
+    };
+    std.log.info(
+        "Send   to {} ({} bytes): {s}",
+        .{ send.fd, send_len, send.buffer.slice[0..send_len] },
+    );
+
+    conn.write_len += send_len;
+    if (conn.write_len >= send.buffer.slice.len) {
+        conn.read_comp = .{
+            .op = .{
+                .recv = .{
+                    .fd = send.fd,
+                    .buffer = .{ .slice = conn.read_buf() },
+                },
+            },
+            .userdata = conn,
+            .callback = recvCallback,
+        };
+        conn.write_len = 0;
+        loop.add(&conn.read_comp);
+        return .disarm;
+    }
     return .rearm;
 }
