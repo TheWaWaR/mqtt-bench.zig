@@ -7,8 +7,6 @@ const net = std.net;
 const posix = std.posix;
 const assert = std.debug.assert;
 
-const ConnMap = std.AutoHashMap(posix.socket_t, Connection);
-
 pub fn main() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
@@ -45,34 +43,38 @@ pub fn main() !void {
 const ServerState = struct {
     connections: ConnMap,
     allocator: mem.Allocator,
+
+    pub fn remove(self: *ServerState, fd: posix.socket_t) void {
+        var pair = self.connections.fetchRemove(fd).?;
+        pair.value.deinit();
+    }
 };
 
+const ConnMap = std.AutoHashMap(posix.socket_t, *Connection);
+
 const Connection = struct {
-    read_comp: *xev.Completion,
-    read_buf: []u8,
-    write_comp: *xev.Completion,
-    write_buf: []u8,
+    buf: [521]u8,
+    read_comp: xev.Completion,
+    write_comp: xev.Completion,
     write_idx: usize = 0,
 
-    pub fn init(state: *ServerState) Connection {
-        const buf = state.allocator.alloc(u8, 512) catch unreachable;
-        const read_buf = buf[0..256];
-        const write_buf = buf[256..512];
-        const read_comp: *xev.Completion = state.allocator.create(xev.Completion) catch unreachable;
-        const write_comp: *xev.Completion = state.allocator.create(xev.Completion) catch unreachable;
-        return .{
-            .read_comp = read_comp,
-            .read_buf = read_buf,
-            .write_comp = write_comp,
-            .write_buf = write_buf,
-        };
+    server_state: *ServerState,
+
+    pub fn init(server_state: *ServerState) *Connection {
+        var conn = server_state.allocator.create(Connection) catch unreachable;
+        conn.server_state = server_state;
+        return conn;
     }
 
-    pub fn deinit(self: *Connection, allocator: mem.Allocator) void {
-        allocator.destroy(self.read_comp);
-        allocator.destroy(self.write_comp);
-        allocator.free(self.read_buf);
-        allocator.free(self.write_buf);
+    pub fn deinit(self: *Connection) void {
+        self.server_state.allocator.destroy(self);
+    }
+
+    pub fn read_buf(self: *Connection) []u8 {
+        return self.buf[0..256];
+    }
+    pub fn write_buf(self: *Connection) []u8 {
+        return self.buf[256..512];
     }
 };
 
@@ -87,17 +89,17 @@ fn acceptCallback(
     const new_fd = result.accept catch unreachable;
     var state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
     const new_conn = Connection.init(state);
-    new_conn.read_comp.* = .{
+    new_conn.read_comp = .{
         .op = .{
             .recv = .{
                 .fd = new_fd,
-                .buffer = .{ .slice = new_conn.read_buf },
+                .buffer = .{ .slice = new_conn.read_buf() },
             },
         },
-        .userdata = state,
+        .userdata = new_conn,
         .callback = recvCallback,
     };
-    loop.add(new_conn.read_comp);
+    loop.add(&new_conn.read_comp);
     state.connections.put(new_fd, new_conn) catch unreachable;
 
     return .rearm;
@@ -112,10 +114,9 @@ fn recvCallback(
     std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
 
     const recv = comp.op.recv;
-    const state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     const read_len = result.recv catch {
-        var pair = state.connections.fetchRemove(recv.fd).?;
-        pair.value.deinit(state.allocator);
+        conn.server_state.remove(recv.fd);
         return .disarm;
     };
     std.log.info(
