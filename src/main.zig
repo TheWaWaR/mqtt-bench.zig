@@ -1,12 +1,16 @@
 const std = @import("std");
-const xev = @import("xev");
 const flags = @import("flags");
+const xev = @import("xev");
+const mqtt = @import("mqtt");
 
 const Instant = std.time.Instant;
+const Utf8View = std.unicode.Utf8View;
 const mem = std.mem;
 const net = std.net;
 const posix = std.posix;
 const assert = std.debug.assert;
+const Packet = mqtt.v3.Packet;
+const Connect = mqtt.v3.Connect;
 
 pub fn main() !void {
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
@@ -16,33 +20,35 @@ pub fn main() !void {
     defer args.deinit();
 
     const cli = flags.parse(&args, Cli, .{});
-    std.log.info("Server: {s}:{}", .{ cli.host, cli.port });
+    const addrs = try std.net.getAddressList(gpa, cli.host, cli.port);
+    std.log.info("Server: {s}:{}, addrs: {any}", .{ cli.host, cli.port, addrs.addrs });
+    if (addrs.addrs.len == 0) {
+        std.log.err("Can't resolve host: {s}", .{cli.host});
+        return;
+    }
+    const addr = addrs.addrs[0];
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    // Create a TCP server socket
-    const address = try net.Address.parseIp4("127.0.0.1", 3131);
-    const kernel_backlog = 1;
-    const ln = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(ln);
-    try posix.setsockopt(ln, posix.SOL.SOCKET, posix.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
-    try posix.bind(ln, &address.any, address.getOsSockLen());
-    try posix.listen(ln, kernel_backlog);
+    // Create a TCP client socket
+    const client_conn = try posix.socket(
+        addr.any.family,
+        posix.SOCK.NONBLOCK | posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        0,
+    );
+    errdefer posix.close(client_conn);
 
-    std.log.info("Listen on {any}", .{address});
+    std.log.info("Connect to {any}", .{addr});
 
-    var state = ServerState{
-        .connections = ConnMap.init(gpa),
-        .allocator = gpa,
-    };
+    var conn = Connection.init(gpa, client_conn);
     // Accept
-    var c_accept: xev.Completion = .{
-        .op = .{ .accept = .{ .socket = ln } },
-        .userdata = &state,
-        .callback = acceptCallback,
+    conn.comp = .{
+        .op = .{ .connect = .{ .socket = client_conn, .addr = addr } },
+        .userdata = conn,
+        .callback = connectCallback,
     };
-    loop.add(&c_accept);
+    loop.add(&conn.comp);
 
     // Run the loop until there are no more completions.
     try loop.run(.until_done);
@@ -64,30 +70,16 @@ const Cli = struct {
     };
 };
 
-const ServerState = struct {
-    connections: ConnMap,
-    allocator: mem.Allocator,
-
-    pub fn remove(self: *ServerState, fd: posix.socket_t) void {
-        var pair = self.connections.fetchRemove(fd).?;
-        pair.value.deinit();
-    }
-};
-
-const ConnMap = std.AutoHashMap(posix.socket_t, *Connection);
-
 const Connection = struct {
     fd: posix.socket_t,
-    buf: [512]u8,
+    read_buf: [256]u8,
+    write_buf: [256]u8,
     comp: xev.Completion,
     write_len: usize = 0,
 
-    server_state: *ServerState,
-
-    pub fn init(server_state: *ServerState, new_fd: posix.socket_t) *Connection {
-        var conn = server_state.allocator.create(Connection) catch unreachable;
+    pub fn init(allocator: mem.Allocator, new_fd: posix.socket_t) *Connection {
+        var conn = allocator.create(Connection) catch unreachable;
         conn.fd = new_fd;
-        conn.server_state = server_state;
         return conn;
     }
 
@@ -95,19 +87,12 @@ const Connection = struct {
         self.server_state.allocator.destroy(self);
     }
 
-    pub fn read_buf(self: *Connection) []u8 {
-        return self.buf[0..256];
-    }
-    pub fn write_buf(self: *Connection) []u8 {
-        return self.buf[256..512];
-    }
-
     pub fn read(self: *Connection, loop: *xev.Loop) void {
         self.comp = .{
             .op = .{
                 .recv = .{
                     .fd = self.fd,
-                    .buffer = .{ .slice = self.read_buf() },
+                    .buffer = .{ .slice = self.read_buf[0..] },
                 },
             },
             .userdata = self,
@@ -140,20 +125,25 @@ const Connection = struct {
     }
 };
 
-fn acceptCallback(
+fn connectCallback(
     ud: ?*anyopaque,
     loop: *xev.Loop,
-    comp: *xev.Completion,
+    _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
+    std.log.info("[connect] result: {any}", .{result});
 
-    const new_fd = result.accept catch unreachable;
-    var state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
-    const new_conn = Connection.init(state, new_fd);
-    new_conn.read(loop);
-    state.connections.put(new_fd, new_conn) catch unreachable;
-    return .rearm;
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    const pkt = Packet{ .connect = Connect{
+        .protocol = .V311,
+        .clean_session = true,
+        .keep_alive = 120,
+        .client_id = Utf8View.initUnchecked("sample"),
+    } };
+    var len: usize = 0;
+    pkt.encode(conn.write_buf[0..], &len) catch unreachable;
+    conn.write(loop, conn.write_buf[0..len]);
+    return .disarm;
 }
 
 fn recvCallback(
@@ -162,7 +152,7 @@ fn recvCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
+    std.log.info("[   recv] result: {any}", .{result});
 
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
@@ -170,11 +160,12 @@ fn recvCallback(
         conn.close(loop);
         return .disarm;
     };
+    const pkt = Packet.decode(recv.buffer.slice[0..read_len]) catch unreachable;
     std.log.info(
-        "Recv from {} ({} bytes): {s}",
-        .{ recv.fd, read_len, recv.buffer.slice[0..read_len] },
+        "Recv from {} ({} bytes): {any}, {any}",
+        .{ recv.fd, read_len, recv.buffer.slice[0..read_len], pkt },
     );
-    conn.write(loop, recv.buffer.slice[0..read_len]);
+    conn.close(loop);
     return .disarm;
 }
 
@@ -184,7 +175,7 @@ fn sendCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
+    std.log.info("[   send] result: {any}", .{result});
 
     const send = comp.op.send;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
@@ -193,7 +184,7 @@ fn sendCallback(
         return .disarm;
     };
     std.log.info(
-        "Send   to {} ({} bytes): {s}",
+        "Send   to {} ({} bytes): {any}",
         .{ send.fd, send_len, send.buffer.slice[0..send_len] },
     );
 
@@ -207,13 +198,11 @@ fn sendCallback(
 }
 
 fn closeCallback(
-    ud: ?*anyopaque,
+    _: ?*anyopaque,
     _: *xev.Loop,
-    comp: *xev.Completion,
+    _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
-    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    conn.server_state.remove(comp.op.close.fd);
+    std.log.info("[  close] result: {any}", .{result});
     return .disarm;
 }
