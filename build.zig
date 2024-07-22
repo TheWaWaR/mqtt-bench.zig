@@ -35,8 +35,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const flags = b.dependency("flags", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("flags", flags.module("flags"));
     const xev = b.dependency("libxev", .{ .target = target, .optimize = optimize });
     exe.root_module.addImport("xev", xev.module("xev"));
+    const mqtt = b.dependency("mqtt", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("mqtt", mqtt.module("mqtt"));
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
