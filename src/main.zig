@@ -53,15 +53,16 @@ const ServerState = struct {
 const ConnMap = std.AutoHashMap(posix.socket_t, *Connection);
 
 const Connection = struct {
-    buf: [521]u8,
-    read_comp: xev.Completion,
-    write_comp: xev.Completion,
+    fd: posix.socket_t,
+    buf: [512]u8,
+    comp: xev.Completion,
     write_len: usize = 0,
 
     server_state: *ServerState,
 
-    pub fn init(server_state: *ServerState) *Connection {
+    pub fn init(server_state: *ServerState, new_fd: posix.socket_t) *Connection {
         var conn = server_state.allocator.create(Connection) catch unreachable;
+        conn.fd = new_fd;
         conn.server_state = server_state;
         return conn;
     }
@@ -76,6 +77,43 @@ const Connection = struct {
     pub fn write_buf(self: *Connection) []u8 {
         return self.buf[256..512];
     }
+
+    pub fn read(self: *Connection, loop: *xev.Loop) void {
+        self.comp = .{
+            .op = .{
+                .recv = .{
+                    .fd = self.fd,
+                    .buffer = .{ .slice = self.read_buf() },
+                },
+            },
+            .userdata = self,
+            .callback = recvCallback,
+        };
+        loop.add(&self.comp);
+    }
+
+    pub fn write(self: *Connection, loop: *xev.Loop, buf: []u8) void {
+        self.comp = .{
+            .op = .{
+                .send = .{
+                    .fd = self.fd,
+                    .buffer = .{ .slice = buf },
+                },
+            },
+            .userdata = self,
+            .callback = sendCallback,
+        };
+        loop.add(&self.comp);
+    }
+
+    pub fn close(self: *Connection, loop: *xev.Loop) void {
+        self.comp = .{
+            .op = .{ .close = .{ .fd = self.fd } },
+            .userdata = self,
+            .callback = closeCallback,
+        };
+        loop.add(&self.comp);
+    }
 };
 
 fn acceptCallback(
@@ -88,20 +126,9 @@ fn acceptCallback(
 
     const new_fd = result.accept catch unreachable;
     var state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
-    const new_conn = Connection.init(state);
-    new_conn.read_comp = .{
-        .op = .{
-            .recv = .{
-                .fd = new_fd,
-                .buffer = .{ .slice = new_conn.read_buf() },
-            },
-        },
-        .userdata = new_conn,
-        .callback = recvCallback,
-    };
-    loop.add(&new_conn.read_comp);
+    const new_conn = Connection.init(state, new_fd);
+    new_conn.read(loop);
     state.connections.put(new_fd, new_conn) catch unreachable;
-
     return .rearm;
 }
 
@@ -116,25 +143,14 @@ fn recvCallback(
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     const read_len = result.recv catch {
-        conn.server_state.remove(recv.fd);
-        // TODO: Close connection
+        conn.close(loop);
         return .disarm;
     };
     std.log.info(
         "Recv from {} ({} bytes): {s}",
         .{ recv.fd, read_len, recv.buffer.slice[0..read_len] },
     );
-    conn.write_comp = .{
-        .op = .{
-            .send = .{
-                .fd = recv.fd,
-                .buffer = .{ .slice = recv.buffer.slice[0..read_len] },
-            },
-        },
-        .userdata = ud,
-        .callback = sendCallback,
-    };
-    loop.add(&conn.write_comp);
+    conn.write(loop, recv.buffer.slice[0..read_len]);
     return .disarm;
 }
 
@@ -149,8 +165,7 @@ fn sendCallback(
     const send = comp.op.send;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     const send_len = result.send catch {
-        conn.server_state.remove(send.fd);
-        // TODO: Close connection
+        conn.close(loop);
         return .disarm;
     };
     std.log.info(
@@ -160,19 +175,21 @@ fn sendCallback(
 
     conn.write_len += send_len;
     if (conn.write_len >= send.buffer.slice.len) {
-        conn.read_comp = .{
-            .op = .{
-                .recv = .{
-                    .fd = send.fd,
-                    .buffer = .{ .slice = conn.read_buf() },
-                },
-            },
-            .userdata = conn,
-            .callback = recvCallback,
-        };
+        conn.read(loop);
         conn.write_len = 0;
-        loop.add(&conn.read_comp);
         return .disarm;
     }
     return .rearm;
+}
+
+fn closeCallback(
+    ud: ?*anyopaque,
+    _: *xev.Loop,
+    comp: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    conn.server_state.remove(comp.op.close.fd);
+    return .disarm;
 }
