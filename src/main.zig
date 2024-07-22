@@ -12,6 +12,11 @@ const assert = std.debug.assert;
 const Packet = mqtt.v3.Packet;
 const Connect = mqtt.v3.Connect;
 
+pub const std_options = .{
+    // Set the log level to info
+    .log_level = .info,
+};
+
 pub fn main() !void {
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
     const gpa = general_purpose_allocator.allocator();
@@ -58,7 +63,7 @@ const Cli = struct {
     pub const name = "mqtt-bench";
     pub const help =
         \\A MQTT benchmark tool written in Zig.
-        \\Based on io_uring, which is blazing fast!
+        \\Based on io_uring, it is blazing fast!
     ;
 
     host: []const u8 = "test.mosquitto.org",
