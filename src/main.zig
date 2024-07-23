@@ -2,6 +2,7 @@ const std = @import("std");
 const flags = @import("flags");
 const xev = @import("xev");
 const mqtt = @import("mqtt");
+const deque = @import("deque.zig");
 
 const Instant = std.time.Instant;
 const Utf8View = std.unicode.Utf8View;
@@ -46,14 +47,14 @@ pub fn main() !void {
 
     std.log.info("Connect to {any}", .{addr});
 
-    var conn = Connection.init(gpa, client_conn);
+    const conn = Connection.init(gpa, client_conn, cli.keep_alive);
     // Accept
-    conn.comp = .{
+    var connect_comp: xev.Completion = .{
         .op = .{ .connect = .{ .socket = client_conn, .addr = addr } },
         .userdata = conn,
         .callback = connectCallback,
     };
-    loop.add(&conn.comp);
+    loop.add(&connect_comp);
 
     // Run the loop until there are no more completions.
     try loop.run(.until_done);
@@ -66,67 +67,97 @@ const Cli = struct {
         \\Based on io_uring, it is blazing fast!
     ;
 
-    host: []const u8 = "test.mosquitto.org",
+    host: []const u8 = "localhost",
     port: u16 = 1883,
+    keep_alive: u16 = 5,
 
     pub const descriptions = .{
         .host = "Host address",
         .port = "Host port",
+        .keep_alive = "Keep alive seconds",
     };
 };
 
+const PacketQueue = deque.Deque(Packet);
+
 const Connection = struct {
     fd: posix.socket_t,
+    keep_alive: u16,
     read_buf: [256]u8,
     write_buf: [256]u8,
-    comp: xev.Completion,
     write_len: usize = 0,
+    read_comp: xev.Completion = .{},
+    write_comp: xev.Completion = .{},
+    close_comp: xev.Completion = .{},
+    keep_alive_comp: xev.Completion = .{},
+    pending_packets: PacketQueue,
+    allocator: mem.Allocator,
 
-    pub fn init(allocator: mem.Allocator, new_fd: posix.socket_t) *Connection {
+    pub fn init(allocator: mem.Allocator, new_fd: posix.socket_t, keep_alive: u16) *Connection {
         var conn = allocator.create(Connection) catch unreachable;
         conn.fd = new_fd;
+        conn.keep_alive = keep_alive;
+        conn.write_len = 0;
+        conn.read_comp = .{};
+        conn.write_comp = .{};
+        conn.close_comp = .{};
+        conn.keep_alive_comp = .{};
+        conn.pending_packets = PacketQueue.init(allocator) catch unreachable;
+        conn.allocator = allocator;
         return conn;
     }
 
     pub fn deinit(self: *Connection) void {
-        self.server_state.allocator.destroy(self);
+        self.pending_packets.deinit();
+        self.allocator.destroy(self);
     }
 
     pub fn read(self: *Connection, loop: *xev.Loop) void {
-        self.comp = .{
-            .op = .{
-                .recv = .{
-                    .fd = self.fd,
-                    .buffer = .{ .slice = self.read_buf[0..] },
+        if (self.read_comp.flags.state == .dead) {
+            self.read_comp = .{
+                .op = .{
+                    .recv = .{
+                        .fd = self.fd,
+                        .buffer = .{ .slice = self.read_buf[0..] },
+                    },
                 },
-            },
-            .userdata = self,
-            .callback = recvCallback,
-        };
-        loop.add(&self.comp);
+                .userdata = self,
+                .callback = recvCallback,
+            };
+            loop.add(&self.read_comp);
+        }
     }
 
-    pub fn write(self: *Connection, loop: *xev.Loop, buf: []u8) void {
-        self.comp = .{
-            .op = .{
-                .send = .{
-                    .fd = self.fd,
-                    .buffer = .{ .slice = buf },
+    pub fn write(self: *Connection, loop: *xev.Loop, pkt: Packet) void {
+        if (self.write_comp.flags.state != .dead or self.write_len > 0) {
+            std.log.info("add to pending: {any}, {}/{}", .{ pkt, self.write_comp.flags.state, self.write_len });
+            self.pending_packets.pushBack(pkt) catch unreachable;
+        } else {
+            std.log.info("write: {any}", .{pkt});
+            var len: usize = 0;
+            pkt.encode(self.write_buf[0..], &len) catch unreachable;
+            self.write_comp = .{
+                .op = .{
+                    .send = .{
+                        .fd = self.fd,
+                        .buffer = .{ .slice = self.write_buf[0..len] },
+                    },
                 },
-            },
-            .userdata = self,
-            .callback = sendCallback,
-        };
-        loop.add(&self.comp);
+                .userdata = self,
+                .callback = sendCallback,
+            };
+            self.write_len = len;
+            loop.add(&self.write_comp);
+        }
     }
 
     pub fn close(self: *Connection, loop: *xev.Loop) void {
-        self.comp = .{
+        self.close_comp = .{
             .op = .{ .close = .{ .fd = self.fd } },
             .userdata = self,
             .callback = closeCallback,
         };
-        loop.add(&self.comp);
+        loop.add(&self.close_comp);
     }
 };
 
@@ -142,12 +173,12 @@ fn connectCallback(
     const pkt = Packet{ .connect = Connect{
         .protocol = .V311,
         .clean_session = true,
-        .keep_alive = 120,
+        .keep_alive = conn.keep_alive,
         .client_id = Utf8View.initUnchecked("sample"),
     } };
-    var len: usize = 0;
-    pkt.encode(conn.write_buf[0..], &len) catch unreachable;
-    conn.write(loop, conn.write_buf[0..len]);
+    conn.read(loop);
+    conn.write(loop, pkt);
+    loop.timer(&conn.keep_alive_comp, conn.keep_alive * 1000, conn, keepAliveCallback);
     return .disarm;
 }
 
@@ -157,7 +188,7 @@ fn recvCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[   recv] result: {any}", .{result});
+    // std.log.info("[  recv ] result: {any}", .{result});
 
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
@@ -170,8 +201,7 @@ fn recvCallback(
         "Recv from {} ({} bytes): {any}, {any}",
         .{ recv.fd, read_len, recv.buffer.slice[0..read_len], pkt },
     );
-    conn.close(loop);
-    return .disarm;
+    return .rearm;
 }
 
 fn sendCallback(
@@ -180,7 +210,7 @@ fn sendCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[   send] result: {any}", .{result});
+    // std.log.info("[  send ] result: {any}", .{result});
 
     const send = comp.op.send;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
@@ -193,21 +223,38 @@ fn sendCallback(
         .{ send.fd, send_len, send.buffer.slice[0..send_len] },
     );
 
-    conn.write_len += send_len;
-    if (conn.write_len >= send.buffer.slice.len) {
-        conn.read(loop);
-        conn.write_len = 0;
+    conn.write_len -= send_len;
+    if (conn.write_len == 0) {
+        if (conn.pending_packets.popFront()) |pkt| {
+            conn.write(loop, pkt);
+        }
         return .disarm;
     }
     return .rearm;
 }
 
+fn keepAliveCallback(
+    ud: ?*anyopaque,
+    loop: *xev.Loop,
+    comp: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = result;
+    // std.log.info("[ timer ] result: {any}", .{result});
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    conn.write(loop, .pingreq);
+    loop.timer(comp, conn.keep_alive * 1000, conn, keepAliveCallback);
+    return .disarm;
+}
+
 fn closeCallback(
-    _: ?*anyopaque,
+    ud: ?*anyopaque,
     _: *xev.Loop,
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[  close] result: {any}", .{result});
+    std.log.info("[ close ] result: {any}", .{result});
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    conn.deinit();
     return .disarm;
 }
