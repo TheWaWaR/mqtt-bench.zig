@@ -89,6 +89,7 @@ const Connection = struct {
     read_comp: xev.Completion = .{},
     write_comp: xev.Completion = .{},
     close_comp: xev.Completion = .{},
+    cancel_comp: xev.Completion = .{},
     keep_alive_comp: xev.Completion = .{},
     pending_packets: PacketQueue,
     allocator: mem.Allocator,
@@ -101,6 +102,7 @@ const Connection = struct {
         conn.read_comp = .{};
         conn.write_comp = .{};
         conn.close_comp = .{};
+        conn.cancel_comp = .{};
         conn.keep_alive_comp = .{};
         conn.pending_packets = PacketQueue.init(allocator) catch unreachable;
         conn.allocator = allocator;
@@ -239,8 +241,7 @@ fn keepAliveCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    _ = result;
-    // std.log.info("[ timer ] result: {any}", .{result});
+    std.log.info("[ timer ] comp: {} result: {any}", .{ comp.flags.state, result });
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     conn.write(loop, .pingreq);
     loop.timer(comp, conn.keep_alive * 1000, conn, keepAliveCallback);
@@ -249,12 +250,51 @@ fn keepAliveCallback(
 
 fn closeCallback(
     ud: ?*anyopaque,
-    _: *xev.Loop,
+    loop: *xev.Loop,
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
     std.log.info("[ close ] result: {any}", .{result});
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    conn.deinit();
+    _ = conn;
+    _ = loop;
+    // conn.cancel_comp = .{
+    //     .op = .{ .cancel = .{ .c = &conn.keep_alive_comp } },
+    //     .userdata = conn,
+    //     .callback = cancelCallback,
+    // };
+    // loop.add(&conn.cancel_comp);
+    return .disarm;
+}
+
+fn cancelCallback(
+    ud: ?*anyopaque,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    std.log.info("[ cancel] result: {any}", .{result});
+    _ = ud;
+    _ = loop;
+    // const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    // inline for (.{
+    //     &conn.keep_alive_comp,
+    //     &conn.read_comp,
+    //     &conn.write_comp,
+    // }, 0..) |comp, idx| {
+    //     if (comp.flags.state != .dead) {
+    //         std.log.info("[{}] comp is {}", .{ idx, comp.flags.state });
+    //         conn.cancel_comp = .{
+    //             .op = .{ .cancel = .{ .c = comp } },
+    //             .userdata = conn,
+    //             .callback = cancelCallback,
+    //         };
+    //         loop.add(&conn.cancel_comp);
+    //         return .disarm;
+    //     } else {
+    //         std.log.info("[{}] comp is dead", .{idx});
+    //     }
+    // }
+    // conn.deinit();
     return .disarm;
 }
