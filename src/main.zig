@@ -98,6 +98,7 @@ const PacketQueue = deque.Deque(Packet);
 const Connection = struct {
     id: usize,
     fd: posix.socket_t,
+    last_ping: i64 = 0,
     closing: bool = false,
     connected: bool = false,
     keep_alive: u16,
@@ -123,6 +124,7 @@ const Connection = struct {
         conn.* = .{
             .id = id,
             .fd = new_fd,
+            .last_ping = std.time.milliTimestamp(),
             .keep_alive = keep_alive,
             .pending_packets = PacketQueue.init(allocator) catch unreachable,
             .allocator = allocator,
@@ -153,7 +155,7 @@ const Connection = struct {
 
     pub fn write(self: *Connection, loop: *xev.Loop, pkt: Packet) void {
         if (self.write_comp.flags.state != .dead or self.write_len > 0) {
-            std.log.debug("add to pending: {any}, {}/{}", .{ pkt, self.write_comp.flags.state, self.write_len });
+            std.log.info("add to pending: {any}, {}/{}", .{ pkt, self.write_comp.flags.state, self.write_len });
             self.pending_packets.pushBack(pkt) catch unreachable;
         } else {
             std.log.debug("write: {any}", .{pkt});
@@ -169,6 +171,9 @@ const Connection = struct {
                 .userdata = self,
                 .callback = sendCallback,
             };
+            if (len == 0) {
+                @panic("zero len");
+            }
             self.write_len = len;
             loop.add(&self.write_comp);
         }
@@ -217,8 +222,7 @@ fn recvCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    // std.log.debug("[  recv ] result: {any}", .{result});
-
+    std.log.debug("[  recv ] result: {any}", .{result});
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     if (conn.closing) {
@@ -235,7 +239,14 @@ fn recvCallback(
         "Recv from {} ({} bytes): {any}, {any}",
         .{ recv.fd, read_len, recv.buffer.slice[0..read_len], pkt },
     );
-    conn.connected = true;
+    if (!conn.connected) {
+        if (pkt.connack.code != .accepted) {
+            std.log.info("[{}] Invalid connack: {}", .{ conn.fd, pkt.connack.code });
+            conn.close(loop);
+            return .disarm;
+        }
+        conn.connected = true;
+    }
     return .rearm;
 }
 
@@ -245,26 +256,41 @@ fn sendCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    // std.log.debug("[  send ] result: {any}", .{result});
-
-    const send = comp.op.send;
+    std.log.debug("[  send ] result: {any}", .{result});
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     if (conn.closing) {
         std.log.debug("[send] connection already closed", .{});
         return .disarm;
     }
+    const send = comp.op.send;
     const send_len = result.send catch {
         std.log.debug("close conn when send", .{});
         conn.close(loop);
         return .disarm;
     };
+    if (comp.flags.state != .dead) {
+        std.log.err(
+            "[{}] Invalid state={}, send_len={}, write_len={}",
+            .{ conn.fd, comp.flags.state, send_len, conn.write_len },
+        );
+    }
     std.log.debug(
         "Send   to {} ({} bytes): {any}",
         .{ send.fd, send_len, send.buffer.slice[0..send_len] },
     );
 
+    if (conn.write_len != send_len) {
+        std.log.err(
+            "[{}] Invalid send len: {}/{} (send_len/write_len)",
+            .{ conn.fd, send_len, conn.write_len },
+        );
+    }
     conn.write_len -= send_len;
     if (conn.write_len == 0) {
+
+        // FIXME: this is a bug of libxev (backend = kqueue)
+        comp.* = .{};
+
         if (conn.pending_packets.popFront()) |pkt| {
             conn.write(loop, pkt);
         }
@@ -286,7 +312,16 @@ fn keepAliveCallback(
         return .disarm;
     }
     conn.write(loop, .pingreq);
-    loop.timer(comp, conn.keep_alive * 1000, conn, keepAliveCallback);
+    const now_ms = std.time.milliTimestamp();
+    const next_ms = conn.keep_alive * 1000;
+    if (now_ms - conn.last_ping >= 1000 + next_ms) {
+        std.log.err(
+            "[{}] Ping delay more than 1 seconds ({}ms)",
+            .{ conn.fd, now_ms - conn.last_ping },
+        );
+    }
+    conn.last_ping = now_ms;
+    loop.timer(&conn.keep_alive_comp, next_ms, conn, keepAliveCallback);
     return .disarm;
 }
 
@@ -296,8 +331,12 @@ fn closeCallback(
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[ close ] result: {any}", .{result});
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    const now_ms = std.time.milliTimestamp();
+    std.log.info(
+        "[ close ][{}] result: {any}, last_ping: {}, now_ms: {} ({})",
+        .{ conn.fd, result, conn.last_ping, now_ms, now_ms - conn.last_ping },
+    );
     conn.ctrl_comp = .{
         .op = .{ .cancel = .{ .c = &conn.keep_alive_comp } },
         .userdata = conn,
