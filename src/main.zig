@@ -37,24 +37,24 @@ pub fn main() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    // Create a TCP client socket
-    const client_conn = try posix.socket(
-        addr.any.family,
-        posix.SOCK.NONBLOCK | posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        0,
-    );
-    errdefer posix.close(client_conn);
-
-    std.log.info("Connect to {any}", .{addr});
-
-    const conn = Connection.init(gpa, client_conn, cli.keep_alive);
-    // Accept
-    var connect_comp: xev.Completion = .{
-        .op = .{ .connect = .{ .socket = client_conn, .addr = addr } },
-        .userdata = conn,
-        .callback = connectCallback,
-    };
-    loop.add(&connect_comp);
+    for (0..cli.connections) |_| {
+        // Create a TCP client socket
+        const client_conn = try posix.socket(
+            addr.any.family,
+            posix.SOCK.NONBLOCK | posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+            0,
+        );
+        errdefer posix.close(client_conn);
+        std.log.info("{} connect to {any}", .{ client_conn, addr });
+        const conn = Connection.init(gpa, client_conn, cli.keep_alive);
+        // Accept
+        conn.ctrl_comp = .{
+            .op = .{ .connect = .{ .socket = client_conn, .addr = addr } },
+            .userdata = conn,
+            .callback = connectCallback,
+        };
+        loop.add(&conn.ctrl_comp);
+    }
 
     // Run the loop until there are no more completions.
     try loop.run(.until_done);
@@ -70,11 +70,18 @@ const Cli = struct {
     host: []const u8 = "localhost",
     port: u16 = 1883,
     keep_alive: u16 = 5,
+    connections: u32 = 1000,
 
     pub const descriptions = .{
         .host = "Host address",
         .port = "Host port",
         .keep_alive = "Keep alive seconds",
+        .connections = "The number of connections",
+    };
+
+    pub const switches = .{
+        .keep_alive = 'k',
+        .connections = 'c',
     };
 };
 
@@ -84,6 +91,7 @@ const Connection = struct {
     fd: posix.socket_t,
     closing: bool = false,
     keep_alive: u16,
+    client_id: [64]u8 = undefined,
     read_buf: [256]u8 = undefined,
     write_buf: [256]u8 = undefined,
     write_len: usize = 0,
@@ -91,7 +99,7 @@ const Connection = struct {
     read_comp: xev.Completion = .{},
     write_comp: xev.Completion = .{},
     keep_alive_comp: xev.Completion = .{},
-    exit_comp: xev.Completion = .{},
+    ctrl_comp: xev.Completion = .{},
     pending_packets: PacketQueue,
     allocator: mem.Allocator,
 
@@ -129,10 +137,10 @@ const Connection = struct {
 
     pub fn write(self: *Connection, loop: *xev.Loop, pkt: Packet) void {
         if (self.write_comp.flags.state != .dead or self.write_len > 0) {
-            std.log.info("add to pending: {any}, {}/{}", .{ pkt, self.write_comp.flags.state, self.write_len });
+            std.log.debug("add to pending: {any}, {}/{}", .{ pkt, self.write_comp.flags.state, self.write_len });
             self.pending_packets.pushBack(pkt) catch unreachable;
         } else {
-            std.log.info("write: {any}", .{pkt});
+            std.log.debug("write: {any}", .{pkt});
             var len: usize = 0;
             pkt.encode(self.write_buf[0..], &len) catch unreachable;
             self.write_comp = .{
@@ -152,12 +160,12 @@ const Connection = struct {
 
     pub fn close(self: *Connection, loop: *xev.Loop) void {
         self.closing = true;
-        self.exit_comp = .{
+        self.ctrl_comp = .{
             .op = .{ .close = .{ .fd = self.fd } },
             .userdata = self,
             .callback = closeCallback,
         };
-        loop.add(&self.exit_comp);
+        loop.add(&self.ctrl_comp);
     }
 };
 
@@ -167,14 +175,18 @@ fn connectCallback(
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[connect] result: {any}", .{result});
-
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    std.log.info("[connect][{}] result: {any}", .{ conn.fd, result });
+    const client_id = std.fmt.bufPrint(
+        conn.client_id[0..],
+        "client-{}",
+        .{conn.fd},
+    ) catch unreachable;
     const pkt = Packet{ .connect = Connect{
         .protocol = .V311,
         .clean_session = true,
         .keep_alive = conn.keep_alive,
-        .client_id = Utf8View.initUnchecked("sample"),
+        .client_id = Utf8View.initUnchecked(client_id),
     } };
     conn.read(loop);
     conn.write(loop, pkt);
@@ -188,21 +200,21 @@ fn recvCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    // std.log.info("[  recv ] result: {any}", .{result});
+    // std.log.debug("[  recv ] result: {any}", .{result});
 
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     if (conn.closing) {
-        std.log.info("[send] connection already closed", .{});
+        std.log.debug("[send] connection already closed", .{});
         return .disarm;
     }
     const read_len = result.recv catch {
-        std.log.info("close conn when recv", .{});
+        std.log.debug("close conn when recv", .{});
         conn.close(loop);
         return .disarm;
     };
     const pkt = Packet.decode(recv.buffer.slice[0..read_len]) catch unreachable;
-    std.log.info(
+    std.log.debug(
         "Recv from {} ({} bytes): {any}, {any}",
         .{ recv.fd, read_len, recv.buffer.slice[0..read_len], pkt },
     );
@@ -215,20 +227,20 @@ fn sendCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    // std.log.info("[  send ] result: {any}", .{result});
+    // std.log.debug("[  send ] result: {any}", .{result});
 
     const send = comp.op.send;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     if (conn.closing) {
-        std.log.info("[send] connection already closed", .{});
+        std.log.debug("[send] connection already closed", .{});
         return .disarm;
     }
     const send_len = result.send catch {
-        std.log.info("close conn when send", .{});
+        std.log.debug("close conn when send", .{});
         conn.close(loop);
         return .disarm;
     };
-    std.log.info(
+    std.log.debug(
         "Send   to {} ({} bytes): {any}",
         .{ send.fd, send_len, send.buffer.slice[0..send_len] },
     );
@@ -249,10 +261,10 @@ fn keepAliveCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[ timer ] comp: {} result: {any}", .{ comp.flags.state, result });
+    std.log.debug("[ timer ] comp: {} result: {any}", .{ comp.flags.state, result });
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     if (conn.closing) {
-        std.log.info("[timer] connection already closed", .{});
+        std.log.debug("[timer] connection already closed", .{});
         return .disarm;
     }
     conn.write(loop, .pingreq);
@@ -266,14 +278,14 @@ fn closeCallback(
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[ close ] result: {any}", .{result});
+    std.log.debug("[ close ] result: {any}", .{result});
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    conn.exit_comp = .{
+    conn.ctrl_comp = .{
         .op = .{ .cancel = .{ .c = &conn.keep_alive_comp } },
         .userdata = conn,
         .callback = cancelCallback,
     };
-    loop.add(&conn.exit_comp);
+    loop.add(&conn.ctrl_comp);
     return .disarm;
 }
 
@@ -283,8 +295,8 @@ fn cancelCallback(
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("[ cancel] result: {any}", .{result});
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    std.log.info("[ cancel][{}] result: {any}", .{ conn.fd, result });
     conn.deinit();
     return .disarm;
 }
