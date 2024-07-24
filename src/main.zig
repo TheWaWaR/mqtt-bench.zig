@@ -82,30 +82,27 @@ const PacketQueue = deque.Deque(Packet);
 
 const Connection = struct {
     fd: posix.socket_t,
+    closing: bool = false,
     keep_alive: u16,
-    read_buf: [256]u8,
-    write_buf: [256]u8,
+    read_buf: [256]u8 = undefined,
+    write_buf: [256]u8 = undefined,
     write_len: usize = 0,
+    // TODO: sizeof(xev.Completion) == 256
     read_comp: xev.Completion = .{},
     write_comp: xev.Completion = .{},
-    close_comp: xev.Completion = .{},
-    cancel_comp: xev.Completion = .{},
     keep_alive_comp: xev.Completion = .{},
+    exit_comp: xev.Completion = .{},
     pending_packets: PacketQueue,
     allocator: mem.Allocator,
 
     pub fn init(allocator: mem.Allocator, new_fd: posix.socket_t, keep_alive: u16) *Connection {
-        var conn = allocator.create(Connection) catch unreachable;
-        conn.fd = new_fd;
-        conn.keep_alive = keep_alive;
-        conn.write_len = 0;
-        conn.read_comp = .{};
-        conn.write_comp = .{};
-        conn.close_comp = .{};
-        conn.cancel_comp = .{};
-        conn.keep_alive_comp = .{};
-        conn.pending_packets = PacketQueue.init(allocator) catch unreachable;
-        conn.allocator = allocator;
+        const conn = allocator.create(Connection) catch unreachable;
+        conn.* = .{
+            .fd = new_fd,
+            .keep_alive = keep_alive,
+            .pending_packets = PacketQueue.init(allocator) catch unreachable,
+            .allocator = allocator,
+        };
         return conn;
     }
 
@@ -154,12 +151,13 @@ const Connection = struct {
     }
 
     pub fn close(self: *Connection, loop: *xev.Loop) void {
-        self.close_comp = .{
+        self.closing = true;
+        self.exit_comp = .{
             .op = .{ .close = .{ .fd = self.fd } },
             .userdata = self,
             .callback = closeCallback,
         };
-        loop.add(&self.close_comp);
+        loop.add(&self.exit_comp);
     }
 };
 
@@ -194,7 +192,12 @@ fn recvCallback(
 
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    if (conn.closing) {
+        std.log.info("[send] connection already closed", .{});
+        return .disarm;
+    }
     const read_len = result.recv catch {
+        std.log.info("close conn when recv", .{});
         conn.close(loop);
         return .disarm;
     };
@@ -216,7 +219,12 @@ fn sendCallback(
 
     const send = comp.op.send;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    if (conn.closing) {
+        std.log.info("[send] connection already closed", .{});
+        return .disarm;
+    }
     const send_len = result.send catch {
+        std.log.info("close conn when send", .{});
         conn.close(loop);
         return .disarm;
     };
@@ -243,6 +251,10 @@ fn keepAliveCallback(
 ) xev.CallbackAction {
     std.log.info("[ timer ] comp: {} result: {any}", .{ comp.flags.state, result });
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    if (conn.closing) {
+        std.log.info("[timer] connection already closed", .{});
+        return .disarm;
+    }
     conn.write(loop, .pingreq);
     loop.timer(comp, conn.keep_alive * 1000, conn, keepAliveCallback);
     return .disarm;
@@ -256,45 +268,23 @@ fn closeCallback(
 ) xev.CallbackAction {
     std.log.info("[ close ] result: {any}", .{result});
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    _ = conn;
-    _ = loop;
-    // conn.cancel_comp = .{
-    //     .op = .{ .cancel = .{ .c = &conn.keep_alive_comp } },
-    //     .userdata = conn,
-    //     .callback = cancelCallback,
-    // };
-    // loop.add(&conn.cancel_comp);
+    conn.exit_comp = .{
+        .op = .{ .cancel = .{ .c = &conn.keep_alive_comp } },
+        .userdata = conn,
+        .callback = cancelCallback,
+    };
+    loop.add(&conn.exit_comp);
     return .disarm;
 }
 
 fn cancelCallback(
     ud: ?*anyopaque,
-    loop: *xev.Loop,
+    _: *xev.Loop,
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
     std.log.info("[ cancel] result: {any}", .{result});
-    _ = ud;
-    _ = loop;
-    // const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    // inline for (.{
-    //     &conn.keep_alive_comp,
-    //     &conn.read_comp,
-    //     &conn.write_comp,
-    // }, 0..) |comp, idx| {
-    //     if (comp.flags.state != .dead) {
-    //         std.log.info("[{}] comp is {}", .{ idx, comp.flags.state });
-    //         conn.cancel_comp = .{
-    //             .op = .{ .cancel = .{ .c = comp } },
-    //             .userdata = conn,
-    //             .callback = cancelCallback,
-    //         };
-    //         loop.add(&conn.cancel_comp);
-    //         return .disarm;
-    //     } else {
-    //         std.log.info("[{}] comp is dead", .{idx});
-    //     }
-    // }
-    // conn.deinit();
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    conn.deinit();
     return .disarm;
 }
