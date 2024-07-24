@@ -177,10 +177,11 @@ fn connectCallback(
 ) xev.CallbackAction {
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     std.log.info("[connect][{}] result: {any}", .{ conn.fd, result });
+    const ts_ms = std.time.milliTimestamp();
     const client_id = std.fmt.bufPrint(
         conn.client_id[0..],
-        "client-{}",
-        .{conn.fd},
+        "{}-{}",
+        .{ ts_ms, conn.fd },
     ) catch unreachable;
     const pkt = Packet{ .connect = Connect{
         .protocol = .V311,
