@@ -37,7 +37,7 @@ pub fn main() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    for (0..cli.connections) |_| {
+    for (0..cli.connections) |idx| {
         // Create a TCP client socket
         const client_conn = try posix.socket(
             addr.any.family,
@@ -45,8 +45,8 @@ pub fn main() !void {
             0,
         );
         errdefer posix.close(client_conn);
-        std.log.info("{} connect to {any}", .{ client_conn, addr });
-        const conn = Connection.init(gpa, client_conn, cli.keep_alive);
+        std.log.info("[{}] {} connect to {any}", .{ idx, client_conn, addr });
+        const conn = Connection.init(gpa, idx, client_conn, cli.keep_alive);
         // Accept
         conn.ctrl_comp = .{
             .op = .{ .connect = .{ .socket = client_conn, .addr = addr } },
@@ -54,6 +54,13 @@ pub fn main() !void {
             .callback = connectCallback,
         };
         loop.add(&conn.ctrl_comp);
+        for (0..50) |_| {
+            loop.run(.once) catch unreachable;
+            if (conn.connected) {
+                std.log.info("[{}] {} connected", .{ idx, client_conn });
+                break;
+            }
+        }
     }
 
     // Run the loop until there are no more completions.
@@ -80,6 +87,7 @@ const Cli = struct {
     };
 
     pub const switches = .{
+        .host = 'H',
         .keep_alive = 'k',
         .connections = 'c',
     };
@@ -88,8 +96,10 @@ const Cli = struct {
 const PacketQueue = deque.Deque(Packet);
 
 const Connection = struct {
+    id: usize,
     fd: posix.socket_t,
     closing: bool = false,
+    connected: bool = false,
     keep_alive: u16,
     client_id: [64]u8 = undefined,
     read_buf: [256]u8 = undefined,
@@ -103,9 +113,15 @@ const Connection = struct {
     pending_packets: PacketQueue,
     allocator: mem.Allocator,
 
-    pub fn init(allocator: mem.Allocator, new_fd: posix.socket_t, keep_alive: u16) *Connection {
+    pub fn init(
+        allocator: mem.Allocator,
+        id: usize,
+        new_fd: posix.socket_t,
+        keep_alive: u16,
+    ) *Connection {
         const conn = allocator.create(Connection) catch unreachable;
         conn.* = .{
+            .id = id,
             .fd = new_fd,
             .keep_alive = keep_alive,
             .pending_packets = PacketQueue.init(allocator) catch unreachable,
@@ -219,6 +235,7 @@ fn recvCallback(
         "Recv from {} ({} bytes): {any}, {any}",
         .{ recv.fd, read_len, recv.buffer.slice[0..read_len], pkt },
     );
+    conn.connected = true;
     return .rearm;
 }
 
@@ -279,7 +296,7 @@ fn closeCallback(
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.debug("[ close ] result: {any}", .{result});
+    std.log.info("[ close ] result: {any}", .{result});
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     conn.ctrl_comp = .{
         .op = .{ .cancel = .{ .c = &conn.keep_alive_comp } },
