@@ -76,7 +76,7 @@ const Cli = struct {
 
     host: []const u8 = "localhost",
     port: u16 = 1883,
-    keep_alive: u16 = 5,
+    keep_alive: u16 = 10,
     connections: u32 = 1000,
 
     pub const descriptions = .{
@@ -287,9 +287,8 @@ fn sendCallback(
     }
     conn.write_len -= send_len;
     if (conn.write_len == 0) {
-
         // FIXME: this is a bug of libxev (backend = kqueue)
-        comp.* = .{};
+        // comp.* = .{};
 
         if (conn.pending_packets.popFront()) |pkt| {
             conn.write(loop, pkt);
