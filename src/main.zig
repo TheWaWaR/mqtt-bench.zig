@@ -3,7 +3,7 @@ const flags = @import("flags");
 const zio = @import("zio");
 const mqtt = @import("mqtt");
 const deque = @import("deque.zig");
-const Client = @import("./Client.zig");
+const Client = @import("./client.zig");
 
 const Instant = std.time.Instant;
 const Utf8View = std.unicode.Utf8View;
@@ -18,6 +18,9 @@ pub const std_options = .{
     // Set the log level to info
     .log_level = .info,
 };
+
+const tick_ms = 10;
+const tick_ns = tick_ms * std.time.ns_per_ms;
 
 pub fn main() !void {
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
@@ -51,7 +54,7 @@ pub fn main() !void {
         client.connect(addr);
         // Accept
         for (0..32) |_| {
-            try io.tick();
+            try io.run_for_ns(50 * 1000);
             if (client.connected) {
                 std.log.info("[{}] id={} connected", .{ client_conn, idx });
                 break;
@@ -60,9 +63,7 @@ pub fn main() !void {
     }
 
     // Run the loop until there are no more completions.
-    while (true) {
-        try io.tick();
-    }
+    while (true) try io.run_for_ns(tick_ns);
 }
 
 const Cli = struct {
