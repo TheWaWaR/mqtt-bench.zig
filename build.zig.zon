@@ -15,10 +15,6 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/1dd3c9015a542757b049f6d33beb8941f57bce1f.tar.gz",
-            .hash = "1220b644b45718a869b37bc37bbc476e69922b21090003b38c1b68a7218fc365771a",
-        },
         .flags = .{
             .url = "https://github.com/n0s4/flags/archive/363c2d487ee4cece282f3c3af48bccb5ac340764.tar.gz",
             .hash = "12204e61d56b67f874cdf426c9675d9136989cd1d08bb42d024e32b30ac13462fada",
@@ -26,6 +22,10 @@
         .mqtt = .{
             .url = "https://github.com/TheWaWaR/mqtt-zig/archive/62e1940d7d0e7dc14dd7094c18db763e8d9545b8.tar.gz",
             .hash = "1220468c63327f91bda5b5e5a17c957ef67a5617c87e3c9141c3628523f19e310022",
+        },
+        .zio = .{
+            .url = "https://github.com/TheWaWaR/zio/archive/645e4366e08678b3d7f9014c7884c64ec7acbcb4.tar.gz",
+            .hash = "12205239bf3394e4b2aea33ec286a62d0aedf8ad9f056549d7882a12b8596c1cc1f8",
         },
     },
     .paths = .{

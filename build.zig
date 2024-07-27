@@ -37,8 +37,8 @@ pub fn build(b: *std.Build) void {
     });
     const flags = b.dependency("flags", .{ .target = target, .optimize = optimize });
     exe.root_module.addImport("flags", flags.module("flags"));
-    const xev = b.dependency("libxev", .{ .target = target, .optimize = optimize });
-    exe.root_module.addImport("xev", xev.module("xev"));
+    const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("zio", zio.module("zio"));
     const mqtt = b.dependency("mqtt", .{ .target = target, .optimize = optimize });
     exe.root_module.addImport("mqtt", mqtt.module("mqtt"));
 
