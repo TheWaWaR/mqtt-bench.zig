@@ -47,7 +47,7 @@ pub fn main() !void {
         );
         errdefer posix.close(client_conn);
         std.log.info("[{}] id={} connect to {any}", .{ client_conn, idx, addr });
-        const client = Client.init(gpa, &io, idx, client_conn, cli.keep_alive);
+        const client = Client.init(gpa, &io, client_conn, cli.keep_alive);
         client.connect(addr);
         // Accept
         for (0..32) |_| {

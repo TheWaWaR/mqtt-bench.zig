@@ -25,7 +25,6 @@ recv_completion: IO.Completion = undefined,
 send_completion: IO.Completion = undefined,
 ctrl_completion: IO.Completion = undefined,
 // Client data
-id: usize,
 keep_alive: u16,
 client_id: [64]u8 = undefined,
 closing: bool = false,
@@ -36,14 +35,12 @@ allocator: mem.Allocator,
 pub fn init(
     allocator: mem.Allocator,
     io: *IO,
-    id: usize,
     sock: posix.socket_t,
     keep_alive: u16,
 ) *Self {
     const self = allocator.create(Self) catch unreachable;
     self.* = .{
         .io = io,
-        .id = id,
         .sock = sock,
         .keep_alive = keep_alive,
         .pending_packets = PacketQueue.init(allocator) catch unreachable,
