@@ -7,8 +7,13 @@ const mem = std.mem;
 const posix = std.posix;
 const log = std.log;
 const Utf8View = std.unicode.Utf8View;
+const Pid = mqtt.types.Pid;
 const Packet = mqtt.v3.Packet;
 const Connect = mqtt.v3.Connect;
+const Publish = mqtt.v3.Publish;
+const Subscribe = mqtt.v3.Subscribe;
+const Suback = mqtt.v3.Suback;
+const FilterWithQoSListView = mqtt.v3.FilterWithQoSListView;
 
 const PacketQueue = deque.Deque(Packet);
 
@@ -20,6 +25,8 @@ pub const Connection = struct {
     connected: bool = false,
     keep_alive: u16,
     pkt_buf: [64]u8 = undefined,
+    topic_name_buf: [64]u8 = undefined,
+    topic_name: []u8 = undefined,
     read_buf: [256]u8 = undefined,
     write_buf: [256]u8 = undefined,
     write_len: usize = 0,
@@ -27,6 +34,7 @@ pub const Connection = struct {
     read_comp: xev.Completion = .{},
     write_comp: xev.Completion = .{},
     keep_alive_comp: xev.Completion = .{},
+    timer_publish_comp: xev.Completion = .{},
     ctrl_comp: xev.Completion = .{},
     pending_packets: PacketQueue,
     allocator: mem.Allocator,
@@ -46,6 +54,7 @@ pub const Connection = struct {
             .pending_packets = PacketQueue.init(allocator) catch unreachable,
             .allocator = allocator,
         };
+        conn.topic_name = std.fmt.bufPrint(conn.topic_name_buf[0..], "testtopic/{}", .{conn.fd}) catch unreachable;
         return conn;
     }
 
@@ -68,6 +77,30 @@ pub const Connection = struct {
             };
             loop.add(&self.read_comp);
         }
+    }
+
+    pub fn subscribe(self: *Connection, loop: *xev.Loop) void {
+        const topic_buf = std.fmt.bufPrint(self.pkt_buf[0..], "testtopic/{}", .{@rem(self.fd, 10)}) catch unreachable;
+        const topic = mqtt.types.TopicFilter.try_from(Utf8View.initUnchecked(topic_buf)) catch unreachable;
+        const topic_qos = .{ .filter = topic, .qos = .level2 };
+        const topics_view = FilterWithQoSListView.encode_to_view(&.{topic_qos}, self.pkt_buf[topic_buf.len..]);
+
+        const pkt = Packet{ .subscribe = Subscribe{
+            .pid = Pid.try_from(345) catch unreachable,
+            .topics = topics_view,
+        } };
+        self.write(loop, pkt);
+    }
+
+    pub fn publish(self: *Connection, loop: *xev.Loop) void {
+        const pkt = Packet{ .publish = Publish{
+            .dup = false,
+            .qos_pid = .level0,
+            .retain = true,
+            .topic_name = mqtt.types.TopicName.try_from(Utf8View.initUnchecked(self.topic_name)) catch unreachable,
+            .payload = "hello",
+        } };
+        self.write(loop, pkt);
     }
 
     pub fn write(self: *Connection, loop: *xev.Loop, pkt: Packet) void {
@@ -130,6 +163,7 @@ pub fn connectCallback(
     conn.read(loop);
     conn.write(loop, pkt);
     loop.timer(&conn.keep_alive_comp, conn.keep_alive * 1000, conn, keepAliveCallback);
+    loop.timer(&conn.timer_publish_comp, 3333, conn, timerPublishCallback);
     return .disarm;
 }
 
@@ -152,16 +186,14 @@ fn recvCallback(
         return .disarm;
     };
     const pkt = Packet.decode(recv.buffer.slice[0..read_len]) catch unreachable;
-    log.debug(
-        "Recv from {} ({} bytes): {any}, {any}",
-        .{ recv.fd, read_len, recv.buffer.slice[0..read_len], pkt },
-    );
+    log.debug("[{}] recv({}): {any}", .{ recv.fd, read_len, pkt });
     if (!conn.connected) {
         if (pkt.connack.code != .accepted) {
             log.info("[{}] Invalid connack: {}", .{ conn.fd, pkt.connack.code });
             conn.close(loop);
             return .disarm;
         }
+        conn.subscribe(loop);
         conn.connected = true;
     }
     return .rearm;
@@ -201,6 +233,7 @@ fn sendCallback(
             "[{}] Invalid send len: {}/{} (send_len/write_len)",
             .{ conn.fd, send_len, conn.write_len },
         );
+        @panic("Ghost send callback");
     }
     conn.write_len -= send_len;
     if (conn.write_len == 0) {
@@ -208,6 +241,7 @@ fn sendCallback(
         // comp.* = .{};
 
         if (conn.pending_packets.popFront()) |pkt| {
+            log.warn("[{}] popFront", .{conn.fd});
             conn.write(loop, pkt);
         }
         return .disarm;
@@ -240,6 +274,22 @@ fn keepAliveCallback(
     }
     conn.last_ping = now_ms;
     loop.timer(&conn.keep_alive_comp, next_ms, conn, keepAliveCallback);
+    return .disarm;
+}
+
+fn timerPublishCallback(
+    ud: ?*anyopaque,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.Result,
+) xev.CallbackAction {
+    const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    if (conn.closing) {
+        log.debug("[timer] connection already closed", .{});
+        return .disarm;
+    }
+    conn.publish(loop);
+    loop.timer(&conn.timer_publish_comp, 3333, conn, timerPublishCallback);
     return .disarm;
 }
 
